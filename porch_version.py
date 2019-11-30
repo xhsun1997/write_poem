@@ -3,7 +3,7 @@ import numpy as np
 from torchnet import meter
 import tqdm
 path='./tang.npz'
-datas=np.load(path)
+datas=np.load(path,allow_pickle=True)
 data,word2id,id2word=datas['data'],datas['word2ix'].item(),datas['ix2word'].item()
 
 assert type(word2id)==type(id2word)==dict
@@ -18,7 +18,7 @@ class Poetry_Model(torch.nn.Module):
         self.hidden_dim=hidden_dim
         self.embedding_dim=embedding_dim
         self.embedding_layer=torch.nn.Embedding(num_embeddings=vocab_size,embedding_dim=embedding_dim)
-        self.lstm_layer=torch.nn.LSTM(input_size=embedding_dim,hidden_size=self.hidden_dim,num_layers=2)
+        self.lstm_layer=torch.nn.LSTM(input_size=embedding_dim,hidden_size=self.hidden_dim,num_layers=3)
         self.linear_layer=torch.nn.Linear(in_features=self.hidden_dim,out_features=vocab_size)
 
     def forward(self,input_data,hidden_state=None):
@@ -45,36 +45,30 @@ class Poetry_Model(torch.nn.Module):
 
 class Config(object):
     lr = 1e-3
-    weight_decay = 1e-4
-    use_gpu = False
-    epoch = 20
+    use_gpu = True
+    epoch = 30
     batch_size = 128
     maxlen = 125 # 超过这个长度的之后字被丢弃，小于这个长度的在前面补空格
-    plot_every = 20 # 每20个batch 可视化一次
-    env='poetry' # visdom env
-    max_gen_len = 200 # 生成诗歌最长长度
-    prefix_words = '细雨鱼儿出,微风燕子斜。' # 不是诗歌的组成部分，用来控制生成诗歌的意境
-    start_words='闲云潭影日悠悠' # 诗歌开始
-    acrostic = False # 是否是藏头诗
+    plot_every = 50 # 每20个batch 可视化一次
+    max_gen_len = 60 # 生成诗歌最长长度
     model_prefix = './log/tang_poem' # 模型保存路径
 
 opt = Config()
 
 dataloader=torch.utils.data.DataLoader(data,batch_size=opt.batch_size,shuffle=True,num_workers=1)
 
-def generate(model,start_word,word2id,id2word,prefix_word=None):
-    results=list(start_word)
-    start_word_len=len(start_word)
-    print(start_word)
+def generate(model,start_words,word2id,id2word,prefix_word=None):
+    results=list(start_words)
+    start_word_len=len(start_words)
+    print(start_words)
 
-    assert start_word_len==1
     input_=torch.Tensor([word2id['<START>']]).view(1,1).long()
     if Config.use_gpu:
         input_=input_.cuda()
     hidden=None
     if prefix_word:
         for word in prefix_word:
-            output,state=model(input_,hidden)
+            output,hidden=model(input_,hidden)
             input_=input_.data.new([word2id[word]]).view(1,1)
             input_=torch.autograd.Variable(input_)
     #If prefix_word!=None we can then see the input_ is the last word of prefix_word and hidden has its own value
@@ -82,14 +76,11 @@ def generate(model,start_word,word2id,id2word,prefix_word=None):
     for i in range(Config.max_gen_len):
         output,hidden=model(input_,hidden)
         if i<start_word_len:
-            assert i==0
-            w=results[i]
-            w_=start_word[i]
-            assert w==w_
+            w=start_words[i]#前面几个开头的词仅仅用于状态的计算，对于输出的值不会用到
+            #如果仅仅给出一个字，那么if语句只会执行一次
             input_=input_.data.new([word2id[w]]).view(1,1)
             input_=torch.autograd.Variable(input_)
         else:
-            assert i>=1
             top_index=output.data[0].topk(1)[1][0].item()
             w=id2word[top_index]
             results.append(w)
@@ -97,6 +88,38 @@ def generate(model,start_word,word2id,id2word,prefix_word=None):
         if w=='<EOP>':
             del results[-1]
             break
+    return results
+
+def gen_acrostic(model,start_words,word2id,id2word,prefix_words=None):
+    results=[]
+    length=len(start_words)
+    print("The length of words ",length)
+    input_=torch.Tensor([word2id['<START>']]).view(1,1).long()
+    hidden=None
+    pre_word = '<START>'
+    if opt.use_gpu:
+        input_=input_.cuda()
+    if prefix_words:
+        for word in prefix_words:
+            output,hidden=model(input_,hidden)
+            input_=input_.data.new([word2id[word]]).view(1,1)
+    index=0
+
+    for i in range(Config.max_gen_len):
+        output,hidden=model(input_,hidden)
+        top_index=output.data[0].topk(1)[1][0].item()
+        w=id2word[top_index]
+        if pre_word in ['。','<START>','！','？']:
+            if index==length:
+                break
+            else:
+                w=start_words[index]
+                index+=1
+                input_=input_.data.new([word2id[w]]).view(1,1)
+        else:
+            input_=input_.data.new([word2id[w]]).view(1,1)
+        results.append(w)
+        pre_word=w
     return results
 
 
@@ -130,7 +153,7 @@ def train():
             loss.backward()
             optimizer.step()
             loss_meter.add(loss.item())
-            if (i)%opt.plot_every==0:
+            if (i+1)%opt.plot_every==0:
                 print("loss value is ",loss_meter.mean)
                 for word in list(u"春江花朝秋月夜"):
                     gen_poetry="".join(generate(model,word,word2id,id2word))
@@ -138,8 +161,20 @@ def train():
 
         torch.save(model.state_dict(),'%s_%s.pth'%(opt.model_prefix,epoch))
 
+def gen():
+    model=Poetry_Model(vocab_size=vocab_size,embedding_dim=150,hidden_dim=256)
+    state_dict=torch.load(opt.model_prefix+"_"+str(opt.epoch-1)+".pth")
+    model.load_state_dict(state_dict)
+    if opt.use_gpu:
+        model.cuda()
+
+    print(generate(model,"羽扇纶巾",word2id,id2word,prefix_word="数风流人物，还看今朝"))
+    print(gen_acrostic(model,"英语演讲",word2id,id2word))
+
+
 if __name__ == '__main__':
     train()
+    gen()
 
 
 
